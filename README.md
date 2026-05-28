@@ -1,14 +1,16 @@
 # RTCM Forwarder
 
 A small Raspberry Pi Python service that reads RTCM correction data from a GNSS
-receiver on `/dev/ttyACM0`, broadcasts the stream over TCP, and publishes the
-same stream to an NTRIP caster mountpoint.
+receiver on `/dev/ttyACM0`, broadcasts the stream over TCP, publishes the same
+stream to an NTRIP caster mountpoint, and exposes browser serial consoles.
 
 ## What it does
 
 - Reads binary RTCM data from a serial device such as `/dev/ttyACM0`.
+- Opens an ESP32/config serial device such as `/dev/ttyUSB0`.
 - Ignores NMEA text and forwards only valid RTCM3 frames by default.
 - Starts a local TCP server so one or more clients can receive the stream.
+- Starts a local web console with interactive GNSS and ESP32 serial panes.
 - Connects to an NTRIP caster as a source/server using:
 
   ```text
@@ -38,10 +40,11 @@ Log out and back in, or reboot:
 sudo reboot
 ```
 
-After reboot, confirm the GNSS receiver appears:
+After reboot, confirm the GNSS receiver and ESP32/config adapter appear:
 
 ```bash
 ls -l /dev/ttyACM0
+ls -l /dev/ttyUSB0
 ```
 
 ## Confirm The Receiver Outputs RTCM
@@ -136,6 +139,12 @@ Start the forwarder:
 .venv/bin/python rtcm-forwarder.py --config config.yaml
 ```
 
+Open the web console:
+
+```text
+http://<pi-ip-address>:8080/
+```
+
 From another device on the network, test the TCP stream:
 
 ```bash
@@ -189,11 +198,18 @@ sudo systemctl disable --now rtcm-forwarder
 serial:
   port: /dev/ttyACM0
   baudrate: 115200
+  config_port: /dev/ttyUSB0
+  config_baudrate: 115200
 
 tcp:
   enabled: true
   host: 0.0.0.0
   port: 2101
+
+web:
+  enabled: true
+  host: 0.0.0.0
+  port: 8080
 
 ntrip:
   enabled: true
@@ -208,6 +224,11 @@ ntrip:
 Set `tcp.enabled` or `ntrip.enabled` to `false` if you only want one output.
 The forwarder always validates RTCM3 frames and ignores non-RTCM serial data, so
 NMEA text is not sent to your TCP clients or NTRIP caster.
+
+The web console shows raw serial activity from both configured serial ports.
+Input submitted in either pane is written back to that pane's serial device.
+The ESP32/config port reconnects automatically if `/dev/ttyUSB0` is unplugged
+or not present when the service starts.
 
 ## Troubleshooting
 

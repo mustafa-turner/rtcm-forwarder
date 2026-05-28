@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import signal
 import sys
@@ -31,6 +34,8 @@ class ConfigError(ValueError):
 class SerialConfig:
     port: str
     baudrate: int
+    config_port: str
+    config_baudrate: int
 
 
 @dataclass(frozen=True)
@@ -52,10 +57,18 @@ class NtripConfig:
 
 
 @dataclass(frozen=True)
+class WebConfig:
+    enabled: bool
+    host: str
+    port: int
+
+
+@dataclass(frozen=True)
 class AppConfig:
     serial: SerialConfig
     tcp: TcpConfig
     ntrip: NtripConfig
+    web: WebConfig
 
 
 def _as_bool(value: Any, field_name: str) -> bool:
@@ -117,19 +130,32 @@ def load_config(path: Path) -> AppConfig:
     serial_raw = raw.get("serial") or {}
     tcp_raw = raw.get("tcp") or {}
     ntrip_raw = raw.get("ntrip") or {}
+    web_raw = raw.get("web") or {}
     if not isinstance(serial_raw, dict):
         raise ConfigError("serial must be a mapping")
     if not isinstance(tcp_raw, dict):
         raise ConfigError("tcp must be a mapping")
     if not isinstance(ntrip_raw, dict):
         raise ConfigError("ntrip must be a mapping")
+    if not isinstance(web_raw, dict):
+        raise ConfigError("web must be a mapping")
 
     serial = SerialConfig(
         port=_as_str(serial_raw.get("port", "/dev/ttyACM0"), "serial.port"),
         baudrate=_as_int(serial_raw.get("baudrate", 115200), "serial.baudrate"),
+        config_port=_as_str(
+            serial_raw.get("config_port", "/dev/ttyUSB0"),
+            "serial.config_port",
+        ),
+        config_baudrate=_as_int(
+            serial_raw.get("config_baudrate", 115200),
+            "serial.config_baudrate",
+        ),
     )
     if serial.baudrate <= 0:
         raise ConfigError("serial.baudrate must be greater than 0")
+    if serial.config_baudrate <= 0:
+        raise ConfigError("serial.config_baudrate must be greater than 0")
 
     tcp = TcpConfig(
         enabled=_as_bool(tcp_raw.get("enabled", True), "tcp.enabled"),
@@ -150,7 +176,13 @@ def load_config(path: Path) -> AppConfig:
     if ntrip.reconnect_seconds <= 0:
         raise ConfigError("ntrip.reconnect_seconds must be greater than 0")
 
-    return AppConfig(serial=serial, tcp=tcp, ntrip=ntrip)
+    web = WebConfig(
+        enabled=_as_bool(web_raw.get("enabled", True), "web.enabled"),
+        host=_as_str(web_raw.get("host", "0.0.0.0"), "web.host"),
+        port=_port(web_raw.get("port", 8080), "web.port"),
+    )
+
+    return AppConfig(serial=serial, tcp=tcp, ntrip=ntrip, web=web)
 
 
 def crc24q(data: bytes) -> int:
@@ -217,6 +249,713 @@ class RtcmFrameExtractor:
             del self.buffer[:frame_length]
 
         return frames
+
+
+WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WEB_CONSOLE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTCM Forwarder Console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101316;
+      --panel: #171c21;
+      --panel-2: #1f252b;
+      --border: #333c45;
+      --text: #edf1f4;
+      --muted: #9da8b2;
+      --accent: #42b883;
+      --warn: #f4c430;
+      --error: #ff6b6b;
+      --input: #0c0f12;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--border);
+      background: #13181d;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .socket-state {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      padding: 14px;
+      height: calc(100vh - 55px);
+    }
+
+    section {
+      display: grid;
+      grid-template-rows: auto minmax(180px, 1fr) auto;
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .console-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel-2);
+    }
+
+    h2 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    .serial-state {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+
+    .serial-state[data-state="connected"] {
+      color: var(--accent);
+    }
+
+    .serial-state[data-state="connecting"],
+    .serial-state[data-state="retrying"] {
+      color: var(--warn);
+    }
+
+    .serial-state[data-state="error"],
+    .serial-state[data-state="write error"] {
+      color: var(--error);
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      min-height: 0;
+      overflow: auto;
+      background: #090b0d;
+      color: #e7ecef;
+      font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    form {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--border);
+      background: var(--panel-2);
+    }
+
+    input,
+    select,
+    button {
+      min-height: 36px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--input);
+      color: var(--text);
+      font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    input {
+      min-width: 0;
+      padding: 0 10px;
+    }
+
+    select {
+      padding: 0 8px;
+    }
+
+    button {
+      padding: 0 12px;
+      cursor: pointer;
+    }
+
+    button:hover,
+    input:focus,
+    select:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    @media (max-width: 850px) {
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      main {
+        grid-template-columns: 1fr;
+        height: auto;
+        min-height: calc(100vh - 85px);
+      }
+
+      section {
+        min-height: 42vh;
+      }
+
+      form {
+        grid-template-columns: minmax(0, 1fr) auto;
+      }
+
+      select {
+        grid-column: 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RTCM Forwarder Console</h1>
+    <div id="socket-state" class="socket-state">connecting</div>
+  </header>
+  <main>
+    <section>
+      <div class="console-head">
+        <h2>GNSS Receiver</h2>
+        <div class="serial-state" data-status="gnss">offline</div>
+      </div>
+      <pre data-log="gnss"></pre>
+      <form data-form="gnss">
+        <input data-input="gnss" autocomplete="off" spellcheck="false">
+        <select data-ending="gnss">
+          <option value="crlf">CRLF</option>
+          <option value="lf">LF</option>
+          <option value="cr">CR</option>
+          <option value="none">None</option>
+        </select>
+        <button type="submit">Send</button>
+        <button type="button" data-clear="gnss">Clear</button>
+      </form>
+    </section>
+    <section>
+      <div class="console-head">
+        <h2>ESP32 Config</h2>
+        <div class="serial-state" data-status="esp32">offline</div>
+      </div>
+      <pre data-log="esp32"></pre>
+      <form data-form="esp32">
+        <input data-input="esp32" autocomplete="off" spellcheck="false">
+        <select data-ending="esp32">
+          <option value="crlf">CRLF</option>
+          <option value="lf">LF</option>
+          <option value="cr">CR</option>
+          <option value="none">None</option>
+        </select>
+        <button type="submit">Send</button>
+        <button type="button" data-clear="esp32">Clear</button>
+      </form>
+    </section>
+  </main>
+  <script>
+    const MAX_CHARS = 120000;
+    const suffixes = { crlf: "\\r\\n", lf: "\\n", cr: "\\r", none: "" };
+    const socketState = document.getElementById("socket-state");
+    const channels = {};
+    let socket = null;
+
+    for (const id of ["gnss", "esp32"]) {
+      channels[id] = {
+        log: document.querySelector(`[data-log="${id}"]`),
+        form: document.querySelector(`[data-form="${id}"]`),
+        input: document.querySelector(`[data-input="${id}"]`),
+        ending: document.querySelector(`[data-ending="${id}"]`),
+        status: document.querySelector(`[data-status="${id}"]`),
+        clear: document.querySelector(`[data-clear="${id}"]`)
+      };
+
+      channels[id].form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        sendLine(id);
+      });
+      channels[id].clear.addEventListener("click", () => {
+        channels[id].log.textContent = "";
+        channels[id].input.focus();
+      });
+      channels[id].log.addEventListener("click", () => channels[id].input.focus());
+    }
+
+    function setSocketState(text) {
+      socketState.textContent = text;
+    }
+
+    function setSerialState(channel, state, detail) {
+      const status = channels[channel]?.status;
+      if (!status) return;
+      status.dataset.state = state;
+      status.textContent = detail ? `${state} ${detail}` : state;
+    }
+
+    function append(channel, text) {
+      const log = channels[channel]?.log;
+      if (!log) return;
+      const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+      log.textContent += text;
+      if (log.textContent.length > MAX_CHARS) {
+        log.textContent = log.textContent.slice(-MAX_CHARS);
+      }
+      if (nearBottom) {
+        log.scrollTop = log.scrollHeight;
+      }
+    }
+
+    function sendLine(channel) {
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const entry = channels[channel];
+      const data = entry.input.value + (suffixes[entry.ending.value] ?? "");
+      socket.send(JSON.stringify({ type: "input", channel, data }));
+      entry.input.value = "";
+      entry.input.focus();
+    }
+
+    function connect() {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      socket = new WebSocket(`${scheme}://${window.location.host}/ws`);
+      setSocketState("connecting");
+
+      socket.addEventListener("open", () => setSocketState("connected"));
+      socket.addEventListener("message", (event) => {
+        let message;
+        try {
+          message = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+
+        if (message.type === "data") {
+          append(message.channel, message.text || "");
+        } else if (message.type === "notice") {
+          append(message.channel, message.text || "");
+        } else if (message.type === "status") {
+          setSerialState(message.channel, message.state || "offline", message.detail || "");
+        }
+      });
+      socket.addEventListener("close", () => {
+        setSocketState("reconnecting");
+        for (const id of Object.keys(channels)) {
+          setSerialState(id, "web offline", "");
+        }
+        window.setTimeout(connect, 1500);
+      });
+    }
+
+    connect();
+  </script>
+</body>
+</html>
+"""
+
+
+def _console_text(data: bytes) -> str:
+    text: list[str] = []
+    index = 0
+    while index < len(data):
+        byte = data[index]
+        if byte == 13:
+            text.append("\n")
+            if index + 1 < len(data) and data[index + 1] == 10:
+                index += 2
+                continue
+        elif byte == 10:
+            text.append("\n")
+        elif byte == 9:
+            text.append("\t")
+        elif 32 <= byte <= 126:
+            text.append(chr(byte))
+        else:
+            text.append(f"\\x{byte:02x}")
+        index += 1
+    return "".join(text)
+
+
+def _websocket_accept(key: str) -> str:
+    digest = hashlib.sha1((key + WEBSOCKET_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _websocket_frame(payload: bytes, opcode: int = 1) -> bytes:
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(length)
+    elif length <= 0xFFFF:
+        header.extend((126, *length.to_bytes(2, "big")))
+    else:
+        header.extend((127, *length.to_bytes(8, "big")))
+    return bytes(header) + payload
+
+
+async def _read_websocket_frame(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    header = await reader.readexactly(2)
+    opcode = header[0] & 0x0F
+    masked = bool(header[1] & 0x80)
+    length = header[1] & 0x7F
+    if length == 126:
+        length = int.from_bytes(await reader.readexactly(2), "big")
+    elif length == 127:
+        length = int.from_bytes(await reader.readexactly(8), "big")
+    if length > 65536:
+        raise RuntimeError("WebSocket frame is too large")
+
+    mask = await reader.readexactly(4) if masked else b""
+    payload = await reader.readexactly(length) if length else b""
+    if masked:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return opcode, payload
+
+
+class WebSocketClient:
+    def __init__(
+        self,
+        server: WebConsoleServer,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        self.server = server
+        self.reader = reader
+        self.writer = writer
+        self.write_lock = asyncio.Lock()
+        self.closed = False
+
+    async def run(self) -> None:
+        try:
+            while True:
+                opcode, payload = await _read_websocket_frame(self.reader)
+                if opcode == 0x8:
+                    break
+                if opcode == 0x9:
+                    await self.send_raw(payload, opcode=0xA)
+                    continue
+                if opcode != 0x1:
+                    continue
+                await self.server.handle_client_message(
+                    self,
+                    payload.decode("utf-8", errors="replace"),
+                )
+        except (ConnectionError, OSError, asyncio.IncompleteReadError, RuntimeError):
+            pass
+        finally:
+            await self.server.remove_client(self)
+
+    async def send_json(self, message: dict[str, Any]) -> bool:
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        return await self.send_raw(payload, opcode=0x1)
+
+    async def send_raw(self, payload: bytes, opcode: int = 0x1) -> bool:
+        if self.closed or self.writer.is_closing():
+            return False
+        try:
+            async with self.write_lock:
+                self.writer.write(_websocket_frame(payload, opcode=opcode))
+                await asyncio.wait_for(self.writer.drain(), timeout=2)
+        except (ConnectionError, OSError, asyncio.TimeoutError):
+            return False
+        return True
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if not self.writer.is_closing():
+            with suppress(ConnectionError, OSError, asyncio.TimeoutError):
+                self.writer.write(_websocket_frame(b"", opcode=0x8))
+                await asyncio.wait_for(self.writer.drain(), timeout=1)
+            self.writer.close()
+            with suppress(ConnectionError, OSError, asyncio.TimeoutError):
+                await asyncio.wait_for(self.writer.wait_closed(), timeout=1)
+
+
+class WebConsoleServer:
+    def __init__(self, config: WebConfig) -> None:
+        self.config = config
+        self.server: asyncio.AbstractServer | None = None
+        self.clients: set[WebSocketClient] = set()
+        self.serial_writers: dict[str, asyncio.StreamWriter | None] = {
+            "gnss": None,
+            "esp32": None,
+        }
+        self.serial_status: dict[str, tuple[str, str]] = {
+            "gnss": ("offline", ""),
+            "esp32": ("offline", ""),
+        }
+
+    async def start(self) -> None:
+        if not self.config.enabled:
+            LOGGER.info("Web console is disabled")
+            return
+
+        self.server = await asyncio.start_server(
+            self._handle_http,
+            self.config.host,
+            self.config.port,
+        )
+        sockets = self.server.sockets or []
+        addresses = ", ".join(str(sock.getsockname()) for sock in sockets)
+        if not addresses:
+            addresses = f"{self.config.host}:{self.config.port}"
+        LOGGER.info("Web console listening on http://%s", addresses)
+
+    async def stop(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+
+        for client in tuple(self.clients):
+            await self.remove_client(client)
+
+    async def set_serial_state(
+        self,
+        channel: str,
+        writer: asyncio.StreamWriter | None,
+        state: str,
+        detail: str = "",
+    ) -> None:
+        if channel not in self.serial_writers:
+            return
+        self.serial_writers[channel] = writer
+        self.serial_status[channel] = (state, detail)
+        await self.broadcast(
+            {
+                "type": "status",
+                "channel": channel,
+                "state": state,
+                "detail": detail,
+            }
+        )
+
+    async def broadcast_serial_data(self, channel: str, data: bytes) -> None:
+        if not data:
+            return
+        await self.broadcast(
+            {
+                "type": "data",
+                "channel": channel,
+                "text": _console_text(data),
+            }
+        )
+
+    async def broadcast(self, message: dict[str, Any]) -> None:
+        if not self.config.enabled or not self.clients:
+            return
+        for client in tuple(self.clients):
+            sent = await client.send_json(message)
+            if not sent:
+                await self.remove_client(client)
+
+    async def handle_client_message(
+        self,
+        client: WebSocketClient,
+        text: str,
+    ) -> None:
+        try:
+            message = json.loads(text)
+        except json.JSONDecodeError:
+            return
+
+        if not isinstance(message, dict) or message.get("type") != "input":
+            return
+        channel = message.get("channel")
+        if channel not in self.serial_writers:
+            return
+        data = message.get("data", "")
+        if not isinstance(data, str):
+            return
+        if len(data) > 4096:
+            await client.send_json(
+                {
+                    "type": "notice",
+                    "channel": channel,
+                    "text": "[input too large]\n",
+                }
+            )
+            return
+
+        writer = self.serial_writers[channel]
+        if writer is None or writer.is_closing():
+            await client.send_json(
+                {
+                    "type": "notice",
+                    "channel": channel,
+                    "text": "[serial port is not connected]\n",
+                }
+            )
+            return
+
+        try:
+            writer.write(data.encode("utf-8", errors="replace"))
+            await asyncio.wait_for(writer.drain(), timeout=2)
+        except (ConnectionError, OSError, asyncio.TimeoutError) as exc:
+            await self.set_serial_state(channel, None, "write error", str(exc))
+
+    async def remove_client(self, client: WebSocketClient) -> None:
+        self.clients.discard(client)
+        await client.close()
+
+    async def _handle_http(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+            request_text = request.decode("latin1", errors="replace")
+            request_line, headers = self._parse_http_request(request_text)
+            method, raw_path, _version = request_line
+            path = raw_path.split("?", 1)[0]
+
+            if self._is_websocket_request(path, headers):
+                await self._handle_websocket(headers, reader, writer)
+                return
+
+            if method == "GET" and path in {"/", "/index.html"}:
+                await self._send_response(
+                    writer,
+                    "200 OK",
+                    WEB_CONSOLE_HTML.encode("utf-8"),
+                    "text/html; charset=utf-8",
+                )
+            else:
+                await self._send_response(
+                    writer,
+                    "404 Not Found",
+                    b"Not found\n",
+                    "text/plain; charset=utf-8",
+                )
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError):
+            with suppress(ConnectionError, OSError):
+                await self._send_response(
+                    writer,
+                    "400 Bad Request",
+                    b"Bad request\n",
+                    "text/plain; charset=utf-8",
+                )
+        finally:
+            if not writer.is_closing():
+                writer.close()
+                with suppress(ConnectionError, OSError, asyncio.TimeoutError):
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1)
+
+    def _parse_http_request(
+        self,
+        request_text: str,
+    ) -> tuple[tuple[str, str, str], dict[str, str]]:
+        lines = request_text.split("\r\n")
+        request_parts = lines[0].split()
+        if len(request_parts) != 3:
+            raise ValueError("Bad HTTP request line")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if not line or ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+        return (request_parts[0], request_parts[1], request_parts[2]), headers
+
+    def _is_websocket_request(self, path: str, headers: dict[str, str]) -> bool:
+        connection = headers.get("connection", "").lower()
+        upgrade = headers.get("upgrade", "").lower()
+        return path == "/ws" and "upgrade" in connection and upgrade == "websocket"
+
+    async def _handle_websocket(
+        self,
+        headers: dict[str, str],
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        key = headers.get("sec-websocket-key")
+        if not key:
+            await self._send_response(
+                writer,
+                "400 Bad Request",
+                b"Missing WebSocket key\n",
+                "text/plain; charset=utf-8",
+            )
+            return
+
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {_websocket_accept(key)}\r\n"
+            "\r\n"
+        )
+        writer.write(response.encode("ascii"))
+        await writer.drain()
+
+        client = WebSocketClient(self, reader, writer)
+        self.clients.add(client)
+        for channel, (state, detail) in self.serial_status.items():
+            await client.send_json(
+                {
+                    "type": "status",
+                    "channel": channel,
+                    "state": state,
+                    "detail": detail,
+                }
+            )
+        await client.run()
+
+    async def _send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        status: str,
+        body: bytes,
+        content_type: str,
+    ) -> None:
+        response = (
+            f"HTTP/1.1 {status}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii") + body
+        writer.write(response)
+        await writer.drain()
 
 
 class TcpBroadcaster:
@@ -396,26 +1135,96 @@ class NtripPublisher:
             LOGGER.info("Dropped %s stale RTCM chunks before NTRIP publishing", dropped)
 
 
+async def run_config_serial_console(
+    config: SerialConfig,
+    web: WebConsoleServer,
+) -> None:
+    reconnect_seconds = 3.0
+    try:
+        while True:
+            writer: asyncio.StreamWriter | None = None
+            try:
+                detail = f"{config.config_port} @ {config.config_baudrate}"
+                await web.set_serial_state("esp32", None, "connecting", detail)
+                reader, writer = await serial_asyncio.open_serial_connection(
+                    url=config.config_port,
+                    baudrate=config.config_baudrate,
+                )
+                await web.set_serial_state("esp32", writer, "connected", detail)
+                LOGGER.info(
+                    "Reading ESP32 config serial from %s at %s baud",
+                    config.config_port,
+                    config.config_baudrate,
+                )
+
+                while True:
+                    data = await reader.read(4096)
+                    if not data:
+                        raise RuntimeError(
+                            f"Config serial port {config.config_port} closed"
+                        )
+                    await web.broadcast_serial_data("esp32", data)
+            except asyncio.CancelledError:
+                raise
+            except (SerialException, OSError, RuntimeError) as exc:
+                LOGGER.warning(
+                    "ESP32 config serial unavailable on %s: %s; retrying in %.1f seconds",
+                    config.config_port,
+                    exc,
+                    reconnect_seconds,
+                )
+                await web.set_serial_state("esp32", None, "retrying", str(exc))
+                await asyncio.sleep(reconnect_seconds)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    with suppress(ConnectionError, OSError, asyncio.TimeoutError, AttributeError):
+                        await asyncio.wait_for(writer.wait_closed(), timeout=2)
+    finally:
+        await web.set_serial_state("esp32", None, "offline", "stopped")
+
+
 async def run_forwarder(config: AppConfig) -> None:
     tcp = TcpBroadcaster(config.tcp)
     ntrip = NtripPublisher(config.ntrip)
+    web = WebConsoleServer(config.web)
     rtcm = RtcmFrameExtractor(validate_crc=RTCM_VALIDATE_CRC)
     forwarded_frames = 0
-    serial_writer = None
+    serial_writer: asyncio.StreamWriter | None = None
+    config_serial_task: asyncio.Task[None] | None = None
 
     await tcp.start()
     await ntrip.start()
+    await web.start()
+    if config.web.enabled:
+        config_serial_task = asyncio.create_task(
+            run_config_serial_console(config.serial, web),
+            name="esp32-config-serial",
+        )
 
     try:
         try:
+            await web.set_serial_state(
+                "gnss",
+                None,
+                "connecting",
+                f"{config.serial.port} @ {config.serial.baudrate}",
+            )
             serial_reader, serial_writer = await serial_asyncio.open_serial_connection(
                 url=config.serial.port,
                 baudrate=config.serial.baudrate,
             )
         except (SerialException, OSError) as exc:
+            await web.set_serial_state("gnss", None, "error", str(exc))
             raise RuntimeError(
                 f"Could not open serial port {config.serial.port}: {exc}"
             ) from exc
+        await web.set_serial_state(
+            "gnss",
+            serial_writer,
+            "connected",
+            f"{config.serial.port} @ {config.serial.baudrate}",
+        )
 
         LOGGER.info(
             "Reading RTCM from %s at %s baud",
@@ -435,6 +1244,7 @@ async def run_forwarder(config: AppConfig) -> None:
             if not data:
                 raise RuntimeError(f"Serial port {config.serial.port} closed")
 
+            await web.broadcast_serial_data("gnss", data)
             frames = rtcm.feed(data)
             if frames:
                 for frame in frames:
@@ -476,8 +1286,18 @@ async def run_forwarder(config: AppConfig) -> None:
                 last_warning_discarded_bytes = rtcm.discarded_bytes
                 last_warning_bad_crc_frames = rtcm.bad_crc_frames
     finally:
+        if config_serial_task is not None:
+            config_serial_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await config_serial_task
         if serial_writer is not None:
+            await web.set_serial_state("gnss", None, "offline", "stopped")
             serial_writer.close()
+            with suppress(ConnectionError, OSError, asyncio.TimeoutError, AttributeError):
+                await asyncio.wait_for(serial_writer.wait_closed(), timeout=2)
+        else:
+            await web.set_serial_state("gnss", None, "offline", "stopped")
+        await web.stop()
         await ntrip.stop()
         await tcp.stop()
 
