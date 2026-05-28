@@ -1,0 +1,17 @@
+serial:
+  port: /dev/ttyACM0
+  baudrate: 115200
+
+tcp:
+  enabled: true
+  host: 0.0.0.0
+  port: 2101
+
+ntrip:
+  enabled: true
+  host: caster.example.com
+  port: 2101
+  mountpoint: MOUNTPOINT
+  password: source-password
+  identifier: raspberry-pi-rtcm
+  reconnect_seconds: 5
