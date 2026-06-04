@@ -123,6 +123,13 @@ ntrip:
   reconnect_seconds: 5
 ```
 
+Set the web console password:
+
+```yaml
+web:
+  password: web-console-password
+```
+
 `config.yaml` is ignored by git so you do not publish your caster password.
 
 ## Run Manually
@@ -210,6 +217,7 @@ web:
   enabled: true
   host: 0.0.0.0
   port: 8080
+  password: web-console-password
 
 ntrip:
   enabled: true
@@ -225,10 +233,13 @@ Set `tcp.enabled` or `ntrip.enabled` to `false` if you only want one output.
 The forwarder always validates RTCM3 frames and ignores non-RTCM serial data, so
 NMEA text is not sent to your TCP clients or NTRIP caster.
 
-The web console shows raw serial activity from both configured serial ports.
-Input submitted in either pane is written back to that pane's serial device.
-The ESP32/config port reconnects automatically if `/dev/ttyUSB0` is unplugged
-or not present when the service starts.
+The web console requires the password from `web.password`.
+
+The web console shows raw serial activity from both configured serial ports and
+an expandable system journal pane for `rtcm-forwarder.service`. Input submitted
+in either serial pane is written back to that pane's serial device.
+Both serial ports reconnect automatically if a USB device is unplugged or not
+present when the service starts.
 
 ## Troubleshooting
 

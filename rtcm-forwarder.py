@@ -9,8 +9,10 @@ import base64
 import hashlib
 import json
 import logging
+import secrets
 import signal
 import sys
+import urllib.parse
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -61,6 +63,7 @@ class WebConfig:
     enabled: bool
     host: str
     port: int
+    password: str
 
 
 @dataclass(frozen=True)
@@ -176,10 +179,17 @@ def load_config(path: Path) -> AppConfig:
     if ntrip.reconnect_seconds <= 0:
         raise ConfigError("ntrip.reconnect_seconds must be greater than 0")
 
+    web_enabled = _as_bool(web_raw.get("enabled", True), "web.enabled")
+    web_password_raw = web_raw.get("password")
+    web_password = "" if web_password_raw is None else str(web_password_raw).strip()
+    if web_enabled and not web_password:
+        raise ConfigError("web.password is required when web.enabled is true")
+
     web = WebConfig(
-        enabled=_as_bool(web_raw.get("enabled", True), "web.enabled"),
+        enabled=web_enabled,
         host=_as_str(web_raw.get("host", "0.0.0.0"), "web.host"),
         port=_port(web_raw.get("port", 8080), "web.port"),
+        password=web_password,
     )
 
     return AppConfig(serial=serial, tcp=tcp, ntrip=ntrip, web=web)
@@ -252,6 +262,113 @@ class RtcmFrameExtractor:
 
 
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+SYSTEM_JOURNAL_UNIT = "rtcm-forwarder.service"
+SYSTEM_JOURNAL_LINES = 80
+LOGIN_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTCM Forwarder Login</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101316;
+      --panel: #171c21;
+      --border: #333c45;
+      --text: #edf1f4;
+      --muted: #9da8b2;
+      --accent: #42b883;
+      --error: #ff6b6b;
+      --input: #0c0f12;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 18px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    main {
+      width: min(100%, 360px);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      padding: 18px;
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: 18px;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+
+    form {
+      display: grid;
+      gap: 10px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input,
+    button {
+      min-height: 40px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--input);
+      color: var(--text);
+      font: 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    input {
+      width: 100%;
+      padding: 0 10px;
+    }
+
+    button {
+      cursor: pointer;
+      background: #1f252b;
+    }
+
+    input:focus,
+    button:hover {
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .error {
+      margin: 0 0 10px;
+      color: var(--error);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>RTCM Forwarder</h1>
+    {{ERROR}}
+    <form method="post" action="/login">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+      <button type="submit">Open Console</button>
+    </form>
+  </main>
+</body>
+</html>
+"""
 WEB_CONSOLE_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -314,18 +431,34 @@ WEB_CONSOLE_HTML = """<!doctype html>
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 14px;
       padding: 14px;
-      height: calc(100vh - 55px);
+      align-items: start;
+      min-height: calc(100vh - 55px);
     }
 
     section {
       display: grid;
       grid-template-rows: auto minmax(180px, 1fr) auto;
       min-width: 0;
-      min-height: 0;
+      height: calc(100vh - 83px);
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--panel);
       overflow: hidden;
+    }
+
+    section[data-panel="system"] {
+      grid-column: 1 / -1;
+      height: 42vh;
+    }
+
+    section[data-collapsed="true"] {
+      grid-template-rows: auto;
+      height: auto;
+    }
+
+    section[data-collapsed="true"] pre,
+    section[data-collapsed="true"] form {
+      display: none;
     }
 
     .console-head {
@@ -336,6 +469,18 @@ WEB_CONSOLE_HTML = """<!doctype html>
       padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       background: var(--panel-2);
+    }
+
+    .console-title {
+      display: grid;
+      gap: 3px;
+      min-width: 0;
+    }
+
+    .console-actions {
+      display: flex;
+      flex: 0 0 auto;
+      gap: 8px;
     }
 
     h2 {
@@ -352,7 +497,6 @@ WEB_CONSOLE_HTML = """<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
-      text-align: right;
     }
 
     .serial-state[data-state="connected"] {
@@ -435,7 +579,16 @@ WEB_CONSOLE_HTML = """<!doctype html>
       }
 
       section {
+        height: auto;
         min-height: 42vh;
+      }
+
+      section[data-panel="system"] {
+        grid-column: auto;
+      }
+
+      section[data-collapsed="true"] {
+        min-height: auto;
       }
 
       form {
@@ -454,10 +607,15 @@ WEB_CONSOLE_HTML = """<!doctype html>
     <div id="socket-state" class="socket-state">connecting</div>
   </header>
   <main>
-    <section>
+    <section data-panel="gnss" data-collapsed="true">
       <div class="console-head">
-        <h2>GNSS Receiver</h2>
-        <div class="serial-state" data-status="gnss">offline</div>
+        <div class="console-title">
+          <h2>GNSS Receiver</h2>
+          <div class="serial-state" data-status="gnss">offline</div>
+        </div>
+        <div class="console-actions">
+          <button type="button" data-toggle="gnss" aria-expanded="false">Show</button>
+        </div>
       </div>
       <pre data-log="gnss"></pre>
       <form data-form="gnss">
@@ -472,10 +630,15 @@ WEB_CONSOLE_HTML = """<!doctype html>
         <button type="button" data-clear="gnss">Clear</button>
       </form>
     </section>
-    <section>
+    <section data-panel="esp32" data-collapsed="true">
       <div class="console-head">
-        <h2>ESP32 Config</h2>
-        <div class="serial-state" data-status="esp32">offline</div>
+        <div class="console-title">
+          <h2>ESP32 Config</h2>
+          <div class="serial-state" data-status="esp32">offline</div>
+        </div>
+        <div class="console-actions">
+          <button type="button" data-toggle="esp32" aria-expanded="false">Show</button>
+        </div>
       </div>
       <pre data-log="esp32"></pre>
       <form data-form="esp32">
@@ -490,6 +653,19 @@ WEB_CONSOLE_HTML = """<!doctype html>
         <button type="button" data-clear="esp32">Clear</button>
       </form>
     </section>
+    <section data-panel="system" data-collapsed="true">
+      <div class="console-head">
+        <div class="console-title">
+          <h2>System Journal</h2>
+          <div class="serial-state" data-status="system">offline</div>
+        </div>
+        <div class="console-actions">
+          <button type="button" data-clear="system">Clear</button>
+          <button type="button" data-toggle="system" aria-expanded="false">Show</button>
+        </div>
+      </div>
+      <pre data-log="system"></pre>
+    </section>
   </main>
   <script>
     const MAX_CHARS = 120000;
@@ -498,29 +674,59 @@ WEB_CONSOLE_HTML = """<!doctype html>
     const channels = {};
     let socket = null;
 
-    for (const id of ["gnss", "esp32"]) {
+    for (const id of ["gnss", "esp32", "system"]) {
       channels[id] = {
+        panel: document.querySelector(`[data-panel="${id}"]`),
         log: document.querySelector(`[data-log="${id}"]`),
         form: document.querySelector(`[data-form="${id}"]`),
         input: document.querySelector(`[data-input="${id}"]`),
         ending: document.querySelector(`[data-ending="${id}"]`),
         status: document.querySelector(`[data-status="${id}"]`),
-        clear: document.querySelector(`[data-clear="${id}"]`)
+        clear: document.querySelector(`[data-clear="${id}"]`),
+        toggle: document.querySelector(`[data-toggle="${id}"]`)
       };
 
-      channels[id].form.addEventListener("submit", (event) => {
-        event.preventDefault();
-        sendLine(id);
-      });
-      channels[id].clear.addEventListener("click", () => {
-        channels[id].log.textContent = "";
-        channels[id].input.focus();
-      });
-      channels[id].log.addEventListener("click", () => channels[id].input.focus());
+      if (channels[id].form) {
+        channels[id].form.addEventListener("submit", (event) => {
+          event.preventDefault();
+          sendLine(id);
+        });
+      }
+      if (channels[id].clear) {
+        channels[id].clear.addEventListener("click", () => {
+          channels[id].log.textContent = "";
+          if (channels[id].input) {
+            channels[id].input.focus();
+          }
+        });
+      }
+      if (channels[id].log && channels[id].input) {
+        channels[id].log.addEventListener("click", () => channels[id].input.focus());
+      }
+      if (channels[id].toggle) {
+        channels[id].toggle.addEventListener("click", () => {
+          const expanded = channels[id].panel.dataset.collapsed === "true";
+          setPanelExpanded(id, expanded);
+        });
+      }
     }
 
     function setSocketState(text) {
       socketState.textContent = text;
+    }
+
+    function setPanelExpanded(channel, expanded) {
+      const entry = channels[channel];
+      if (!entry?.panel || !entry.toggle) return;
+      entry.panel.dataset.collapsed = expanded ? "false" : "true";
+      entry.toggle.textContent = expanded ? "Hide" : "Show";
+      entry.toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+      if (expanded) {
+        entry.log.scrollTop = entry.log.scrollHeight;
+        if (entry.input) {
+          entry.input.focus();
+        }
+      }
     }
 
     function setSerialState(channel, state, detail) {
@@ -546,6 +752,7 @@ WEB_CONSOLE_HTML = """<!doctype html>
     function sendLine(channel) {
       if (!socket || socket.readyState !== WebSocket.OPEN) return;
       const entry = channels[channel];
+      if (!entry?.input || !entry.ending) return;
       const data = entry.input.value + (suffixes[entry.ending.value] ?? "");
       socket.send(JSON.stringify({ type: "input", channel, data }));
       entry.input.value = "";
@@ -712,15 +919,18 @@ class WebSocketClient:
 class WebConsoleServer:
     def __init__(self, config: WebConfig) -> None:
         self.config = config
+        self.auth_cookie = secrets.token_urlsafe(32) if config.password else ""
         self.server: asyncio.AbstractServer | None = None
+        self.journal_task: asyncio.Task[None] | None = None
         self.clients: set[WebSocketClient] = set()
         self.serial_writers: dict[str, asyncio.StreamWriter | None] = {
             "gnss": None,
             "esp32": None,
         }
-        self.serial_status: dict[str, tuple[str, str]] = {
+        self.channel_status: dict[str, tuple[str, str]] = {
             "gnss": ("offline", ""),
             "esp32": ("offline", ""),
+            "system": ("offline", ""),
         }
 
     async def start(self) -> None:
@@ -738,8 +948,18 @@ class WebConsoleServer:
         if not addresses:
             addresses = f"{self.config.host}:{self.config.port}"
         LOGGER.info("Web console listening on http://%s", addresses)
+        self.journal_task = asyncio.create_task(
+            self._run_system_journal(),
+            name="system-journal",
+        )
 
     async def stop(self) -> None:
+        if self.journal_task is not None:
+            self.journal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.journal_task
+            self.journal_task = None
+
         if self.server is not None:
             self.server.close()
             await self.server.wait_closed()
@@ -758,7 +978,17 @@ class WebConsoleServer:
         if channel not in self.serial_writers:
             return
         self.serial_writers[channel] = writer
-        self.serial_status[channel] = (state, detail)
+        await self.set_channel_state(channel, state, detail)
+
+    async def set_channel_state(
+        self,
+        channel: str,
+        state: str,
+        detail: str = "",
+    ) -> None:
+        if channel not in self.channel_status:
+            return
+        self.channel_status[channel] = (state, detail)
         await self.broadcast(
             {
                 "type": "status",
@@ -786,6 +1016,73 @@ class WebConsoleServer:
             sent = await client.send_json(message)
             if not sent:
                 await self.remove_client(client)
+
+    async def _run_system_journal(self) -> None:
+        reconnect_seconds = 5.0
+        command_detail = f"journalctl -u {SYSTEM_JOURNAL_UNIT} -f"
+        while True:
+            process = None
+            try:
+                await self.set_channel_state("system", "connecting", command_detail)
+                process = await asyncio.create_subprocess_exec(
+                    "journalctl",
+                    "-u",
+                    SYSTEM_JOURNAL_UNIT,
+                    "-f",
+                    "-n",
+                    str(SYSTEM_JOURNAL_LINES),
+                    "--no-pager",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await self.set_channel_state("system", "connected", command_detail)
+                LOGGER.info("System journal monitor started: %s", command_detail)
+
+                if process.stdout is None:
+                    raise RuntimeError("journalctl stdout was not available")
+
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    await self.broadcast(
+                        {
+                            "type": "data",
+                            "channel": "system",
+                            "text": line.decode("utf-8", errors="replace"),
+                        }
+                    )
+
+                returncode = await process.wait()
+                raise RuntimeError(f"journalctl exited with status {returncode}")
+            except asyncio.CancelledError:
+                raise
+            except (FileNotFoundError, RuntimeError, OSError) as exc:
+                LOGGER.warning(
+                    "System journal monitor unavailable: %s; retrying in %.1f seconds",
+                    exc,
+                    reconnect_seconds,
+                )
+                await self.set_channel_state("system", "retrying", str(exc))
+                await self.broadcast(
+                    {
+                        "type": "notice",
+                        "channel": "system",
+                        "text": f"[journal monitor unavailable: {exc}]\n",
+                    }
+                )
+                await asyncio.sleep(reconnect_seconds)
+            finally:
+                if process is not None and process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        with suppress(ProcessLookupError):
+                            process.kill()
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(process.wait(), timeout=2)
 
     async def handle_client_message(
         self,
@@ -842,23 +1139,56 @@ class WebConsoleServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         try:
-            request = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
-            request_text = request.decode("latin1", errors="replace")
+            request_head = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=5,
+            )
+            request_text = request_head.decode("latin1", errors="replace")
             request_line, headers = self._parse_http_request(request_text)
             method, raw_path, _version = request_line
             path = raw_path.split("?", 1)[0]
+            body = b""
+            content_length = self._content_length(headers)
+            if content_length:
+                body = await asyncio.wait_for(
+                    reader.readexactly(content_length),
+                    timeout=5,
+                )
 
             if self._is_websocket_request(path, headers):
+                if not self._is_authenticated(headers):
+                    await self._send_response(
+                        writer,
+                        "401 Unauthorized",
+                        b"Authentication required\n",
+                        "text/plain; charset=utf-8",
+                    )
+                    return
                 await self._handle_websocket(headers, reader, writer)
                 return
 
+            if method == "POST" and path == "/login":
+                if self._login_password_matches(headers, body):
+                    await self._send_redirect(writer, "/")
+                else:
+                    await self._send_login_page(writer, invalid=True)
+                return
+
             if method == "GET" and path in {"/", "/index.html"}:
-                await self._send_response(
-                    writer,
-                    "200 OK",
-                    WEB_CONSOLE_HTML.encode("utf-8"),
-                    "text/html; charset=utf-8",
-                )
+                if self._is_authenticated(headers):
+                    await self._send_response(
+                        writer,
+                        "200 OK",
+                        WEB_CONSOLE_HTML.encode("utf-8"),
+                        "text/html; charset=utf-8",
+                    )
+                else:
+                    await self._send_login_page(writer)
+            elif method == "GET" and path == "/login":
+                if self._is_authenticated(headers):
+                    await self._send_redirect(writer, "/")
+                else:
+                    await self._send_login_page(writer)
             else:
                 await self._send_response(
                     writer,
@@ -896,10 +1226,90 @@ class WebConsoleServer:
             headers[name.strip().lower()] = value.strip()
         return (request_parts[0], request_parts[1], request_parts[2]), headers
 
+    def _content_length(self, headers: dict[str, str]) -> int:
+        value = headers.get("content-length", "0")
+        try:
+            length = int(value)
+        except ValueError as exc:
+            raise ValueError("Bad content length") from exc
+        if length < 0 or length > 4096:
+            raise ValueError("Bad content length")
+        return length
+
     def _is_websocket_request(self, path: str, headers: dict[str, str]) -> bool:
         connection = headers.get("connection", "").lower()
         upgrade = headers.get("upgrade", "").lower()
         return path == "/ws" and "upgrade" in connection and upgrade == "websocket"
+
+    def _is_authenticated(self, headers: dict[str, str]) -> bool:
+        if not self.config.password:
+            return True
+        return self._has_auth_cookie(headers)
+
+    def _login_password_matches(
+        self,
+        headers: dict[str, str],
+        body: bytes,
+    ) -> bool:
+        if not self.config.password:
+            return True
+        content_type = headers.get("content-type", "").split(";", 1)[0].strip()
+        if content_type and content_type != "application/x-www-form-urlencoded":
+            return False
+        form = urllib.parse.parse_qs(
+            body.decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+            strict_parsing=False,
+        )
+        password = form.get("password", [""])[0]
+        return secrets.compare_digest(password, self.config.password)
+
+    def _has_auth_cookie(self, headers: dict[str, str]) -> bool:
+        cookie_header = headers.get("cookie", "")
+        for cookie in cookie_header.split(";"):
+            name, separator, value = cookie.strip().partition("=")
+            if (
+                separator
+                and name == "rtcm_auth"
+                and secrets.compare_digest(value, self.auth_cookie)
+            ):
+                return True
+        return False
+
+    def _auth_success_headers(self) -> dict[str, str]:
+        if not self.auth_cookie:
+            return {}
+        return {
+            "Set-Cookie": (
+                f"rtcm_auth={self.auth_cookie}; Path=/; SameSite=Strict; HttpOnly"
+            ),
+        }
+
+    async def _send_login_page(
+        self,
+        writer: asyncio.StreamWriter,
+        invalid: bool = False,
+    ) -> None:
+        error = '<p class="error">Incorrect password</p>' if invalid else ""
+        await self._send_response(
+            writer,
+            "200 OK",
+            LOGIN_HTML.replace("{{ERROR}}", error).encode("utf-8"),
+            "text/html; charset=utf-8",
+        )
+
+    async def _send_redirect(
+        self,
+        writer: asyncio.StreamWriter,
+        location: str,
+    ) -> None:
+        await self._send_response(
+            writer,
+            "303 See Other",
+            b"Redirecting\n",
+            "text/plain; charset=utf-8",
+            {"Location": location, **self._auth_success_headers()},
+        )
 
     async def _handle_websocket(
         self,
@@ -929,7 +1339,7 @@ class WebConsoleServer:
 
         client = WebSocketClient(self, reader, writer)
         self.clients.add(client)
-        for channel, (state, detail) in self.serial_status.items():
+        for channel, (state, detail) in self.channel_status.items():
             await client.send_json(
                 {
                     "type": "status",
@@ -946,14 +1356,17 @@ class WebConsoleServer:
         status: str,
         body: bytes,
         content_type: str,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
-        response = (
-            f"HTTP/1.1 {status}\r\n"
-            f"Content-Type: {content_type}\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode("ascii") + body
+        headers = [
+            f"HTTP/1.1 {status}",
+            f"Content-Type: {content_type}",
+            f"Content-Length: {len(body)}",
+            "Connection: close",
+        ]
+        if extra_headers:
+            headers.extend(f"{name}: {value}" for name, value in extra_headers.items())
+        response = ("\r\n".join(headers) + "\r\n\r\n").encode("ascii") + body
         writer.write(response)
         await writer.drain()
 
@@ -1188,10 +1601,10 @@ async def run_forwarder(config: AppConfig) -> None:
     tcp = TcpBroadcaster(config.tcp)
     ntrip = NtripPublisher(config.ntrip)
     web = WebConsoleServer(config.web)
-    rtcm = RtcmFrameExtractor(validate_crc=RTCM_VALIDATE_CRC)
     forwarded_frames = 0
     serial_writer: asyncio.StreamWriter | None = None
     config_serial_task: asyncio.Task[None] | None = None
+    serial_reconnect_seconds = 3.0
 
     await tcp.start()
     await ntrip.start()
@@ -1203,88 +1616,101 @@ async def run_forwarder(config: AppConfig) -> None:
         )
 
     try:
-        try:
-            await web.set_serial_state(
-                "gnss",
-                None,
-                "connecting",
-                f"{config.serial.port} @ {config.serial.baudrate}",
-            )
-            serial_reader, serial_writer = await serial_asyncio.open_serial_connection(
-                url=config.serial.port,
-                baudrate=config.serial.baudrate,
-            )
-        except (SerialException, OSError) as exc:
-            await web.set_serial_state("gnss", None, "error", str(exc))
-            raise RuntimeError(
-                f"Could not open serial port {config.serial.port}: {exc}"
-            ) from exc
-        await web.set_serial_state(
-            "gnss",
-            serial_writer,
-            "connected",
-            f"{config.serial.port} @ {config.serial.baudrate}",
-        )
-
-        LOGGER.info(
-            "Reading RTCM from %s at %s baud",
-            config.serial.port,
-            config.serial.baudrate,
-        )
-        LOGGER.info("RTCM3 frame filtering is enabled")
-
-        loop = asyncio.get_running_loop()
-        last_valid_frame_time = loop.time()
-        last_no_frame_warning = loop.time()
-        last_warning_discarded_bytes = 0
-        last_warning_bad_crc_frames = 0
-        rtcm_warning_active = False
         while True:
-            data = await serial_reader.read(4096)
-            if not data:
-                raise RuntimeError(f"Serial port {config.serial.port} closed")
+            try:
+                detail = f"{config.serial.port} @ {config.serial.baudrate}"
+                await web.set_serial_state("gnss", None, "connecting", detail)
+                (
+                    serial_reader,
+                    serial_writer,
+                ) = await serial_asyncio.open_serial_connection(
+                    url=config.serial.port,
+                    baudrate=config.serial.baudrate,
+                )
+                await web.set_serial_state("gnss", serial_writer, "connected", detail)
 
-            await web.broadcast_serial_data("gnss", data)
-            frames = rtcm.feed(data)
-            if frames:
-                for frame in frames:
-                    await tcp.broadcast(frame)
-                    ntrip.publish(frame)
+                LOGGER.info(
+                    "Reading RTCM from %s at %s baud",
+                    config.serial.port,
+                    config.serial.baudrate,
+                )
+                LOGGER.info("RTCM3 frame filtering is enabled")
 
-                if forwarded_frames == 0:
-                    LOGGER.info("First valid RTCM3 frame received")
-                elif rtcm_warning_active:
-                    LOGGER.info("Valid RTCM3 frames resumed")
-                    rtcm_warning_active = False
-                forwarded_frames += len(frames)
+                rtcm = RtcmFrameExtractor(validate_crc=RTCM_VALIDATE_CRC)
+                loop = asyncio.get_running_loop()
                 last_valid_frame_time = loop.time()
-                continue
+                last_no_frame_warning = loop.time()
+                last_warning_discarded_bytes = 0
+                last_warning_bad_crc_frames = 0
+                rtcm_warning_active = False
+                while True:
+                    data = await serial_reader.read(4096)
+                    if not data:
+                        raise RuntimeError(f"Serial port {config.serial.port} closed")
 
-            now = loop.time()
-            no_frame_seconds = now - last_valid_frame_time
-            should_warn = (
-                no_frame_seconds >= NO_RTCM_WARNING_SECONDS
-                and now - last_no_frame_warning >= NO_RTCM_WARNING_SECONDS
-            )
-            if should_warn:
-                discarded_since_last_warning = (
-                    rtcm.discarded_bytes - last_warning_discarded_bytes
-                )
-                bad_crc_since_last_warning = (
-                    rtcm.bad_crc_frames - last_warning_bad_crc_frames
-                )
+                    await web.broadcast_serial_data("gnss", data)
+                    frames = rtcm.feed(data)
+                    if frames:
+                        for frame in frames:
+                            await tcp.broadcast(frame)
+                            ntrip.publish(frame)
+
+                        if forwarded_frames == 0:
+                            LOGGER.info("First valid RTCM3 frame received")
+                        elif rtcm_warning_active:
+                            LOGGER.info("Valid RTCM3 frames resumed")
+                            rtcm_warning_active = False
+                        forwarded_frames += len(frames)
+                        last_valid_frame_time = loop.time()
+                        continue
+
+                    now = loop.time()
+                    no_frame_seconds = now - last_valid_frame_time
+                    should_warn = (
+                        no_frame_seconds >= NO_RTCM_WARNING_SECONDS
+                        and now - last_no_frame_warning >= NO_RTCM_WARNING_SECONDS
+                    )
+                    if should_warn:
+                        discarded_since_last_warning = (
+                            rtcm.discarded_bytes - last_warning_discarded_bytes
+                        )
+                        bad_crc_since_last_warning = (
+                            rtcm.bad_crc_frames - last_warning_bad_crc_frames
+                        )
+                        LOGGER.warning(
+                            "Serial data is arriving, but no valid RTCM3 frames were found "
+                            "in the last %.0f seconds. Ignored %s non-RTCM bytes and %s "
+                            "bad-CRC frame candidates during that period.",
+                            no_frame_seconds,
+                            discarded_since_last_warning,
+                            bad_crc_since_last_warning,
+                        )
+                        rtcm_warning_active = True
+                        last_no_frame_warning = now
+                        last_warning_discarded_bytes = rtcm.discarded_bytes
+                        last_warning_bad_crc_frames = rtcm.bad_crc_frames
+            except asyncio.CancelledError:
+                raise
+            except (SerialException, OSError, RuntimeError) as exc:
                 LOGGER.warning(
-                    "Serial data is arriving, but no valid RTCM3 frames were found "
-                    "in the last %.0f seconds. Ignored %s non-RTCM bytes and %s "
-                    "bad-CRC frame candidates during that period.",
-                    no_frame_seconds,
-                    discarded_since_last_warning,
-                    bad_crc_since_last_warning,
+                    "GNSS serial unavailable on %s: %s; retrying in %.1f seconds",
+                    config.serial.port,
+                    exc,
+                    serial_reconnect_seconds,
                 )
-                rtcm_warning_active = True
-                last_no_frame_warning = now
-                last_warning_discarded_bytes = rtcm.discarded_bytes
-                last_warning_bad_crc_frames = rtcm.bad_crc_frames
+                await web.set_serial_state("gnss", None, "retrying", str(exc))
+                await asyncio.sleep(serial_reconnect_seconds)
+            finally:
+                if serial_writer is not None:
+                    serial_writer.close()
+                    with suppress(
+                        ConnectionError,
+                        OSError,
+                        asyncio.TimeoutError,
+                        AttributeError,
+                    ):
+                        await asyncio.wait_for(serial_writer.wait_closed(), timeout=2)
+                    serial_writer = None
     finally:
         if config_serial_task is not None:
             config_serial_task.cancel()
@@ -1293,7 +1719,12 @@ async def run_forwarder(config: AppConfig) -> None:
         if serial_writer is not None:
             await web.set_serial_state("gnss", None, "offline", "stopped")
             serial_writer.close()
-            with suppress(ConnectionError, OSError, asyncio.TimeoutError, AttributeError):
+            with suppress(
+                ConnectionError,
+                OSError,
+                asyncio.TimeoutError,
+                AttributeError,
+            ):
                 await asyncio.wait_for(serial_writer.wait_closed(), timeout=2)
         else:
             await web.set_serial_state("gnss", None, "offline", "stopped")
